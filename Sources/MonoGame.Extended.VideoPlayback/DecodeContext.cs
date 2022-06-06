@@ -378,97 +378,121 @@ namespace MonoGame.Extended.VideoPlayback {
         /// </summary>
         /// <param name="presentationTime">Current playback time, in seconds.</param>
         internal void ReadVideoUntilPlaybackIsAfter(double presentationTime) {
-            EnsureNotDisposed();
-            EnsureInitialized();
+            try
+            {
+                EnsureNotDisposed();
+                EnsureInitialized();
 
-            // If we don't have to decode any new frame (just use the current one), skip the later procedures.
-            if (_nextDecodingVideoTime > presentationTime) {
-                return;
-            }
+                // If we don't have to decode any new frame (just use the current one), skip the later procedures.
+                if (_nextDecodingVideoTime > presentationTime)
+                {
+                    return;
+                }
 
-            var videoContext = _videoContext;
-            var videoStream = _videoStream;
-            var framePool = _videoFramePool;
-            var frameQueue = _preparedVideoFrames;
-            var videoPackets = _videoPackets;
+                var videoContext = _videoContext;
+                var videoStream = _videoStream;
+                var framePool = _videoFramePool;
+                var frameQueue = _preparedVideoFrames;
+                var videoPackets = _videoPackets;
 
-            if (videoContext == null || videoStream == null || framePool == null || frameQueue == null || videoPackets == null) {
-                return;
-            }
+                if (videoContext == null || videoStream == null || framePool == null || frameQueue == null || videoPackets == null)
+                {
+                    return;
+                }
 
-            bool r;
-            double decodedPresentationTime = 0;
+                bool r;
+                double decodedPresentationTime = 0;
 
-            // The double queue + object pool design is used to solve the I/P/B frame order problem.
-            // For details about I/P/B frames, see http://dranger.com/ffmpeg/tutorial05.html.
+                // The double queue + object pool design is used to solve the I/P/B frame order problem.
+                // For details about I/P/B frames, see http://dranger.com/ffmpeg/tutorial05.html.
 
-            do {
-                // Try to fetch a number of video frames.
-                r = TryFetchVideoFrames(_decodingOptions.VideoPacketQueueSizeThreshold);
+                do
+                {
+                    // Try to fetch a number of video frames.
+                    r = TryFetchVideoFrames(_decodingOptions.VideoPacketQueueSizeThreshold);
 
-                if (r) {
-                    // If the queue of decoded frames is not empty, then get its presentation timestamp (PTS) and convert it to seconds.
-                    var decodedPresentationPts = frameQueue.PeekFirstKey();
-                    decodedPresentationTime = PtsToSeconds(videoStream, decodedPresentationPts + _videoStartPts);
+                    if (r)
+                    {
+                        // If the queue of decoded frames is not empty, then get its presentation timestamp (PTS) and convert it to seconds.
+                        var decodedPresentationPts = frameQueue.PeekFirstKey();
+                        decodedPresentationTime = PtsToSeconds(videoStream, decodedPresentationPts + _videoStartPts);
 
-                    // Now get the frame.
-                    var p = frameQueue.Dequeue();
-                    var frame = (AVFrame*)p;
+                        // Now get the frame.
+                        var p = frameQueue.Dequeue();
+                        var frame = (AVFrame*)p;
 
-                    if (decodedPresentationTime < presentationTime) {
-                        // If the time is before current playback time, release the frame because we don't need it anymore.
-                        framePool.Release(p);
-                    } else {
-                        // Otherwise, set it as the current frame.
-                        lock (VideoFrameTransmissionLock) {
-                            var origFrame = _currentVideoFrame;
+                        if (decodedPresentationTime < presentationTime)
+                        {
+                            // If the time is before current playback time, release the frame because we don't need it anymore.
+                            framePool.Release(p);
+                        }
+                        else
+                        {
+                            // Otherwise, set it as the current frame.
+                            lock (VideoFrameTransmissionLock)
+                            {
+                                var origFrame = _currentVideoFrame;
 
-                            _currentVideoFrame = frame;
+                                _currentVideoFrame = frame;
 
-                            if (origFrame != null) {
-                                framePool.Release((IntPtr)origFrame);
+                                if (origFrame != null)
+                                {
+                                    framePool.Release((IntPtr)origFrame);
+                                }
                             }
                         }
+
+                        // Caveats:
+                        // The "current" frame is actually the first frame whose PTS is after current playback time.
+                        // But for most videos, this does not matter.
+                        // We can make it a little more complicated (queries if there is a second frame in the sorted list)
+                        // to get the actual "current" frame.
                     }
+                } while (r && decodedPresentationTime < presentationTime);
 
-                    // Caveats:
-                    // The "current" frame is actually the first frame whose PTS is after current playback time.
-                    // But for most videos, this does not matter.
-                    // We can make it a little more complicated (queries if there is a second frame in the sorted list)
-                    // to get the actual "current" frame.
+                // If we did get a frame to show, then update the time.
+                if (r)
+                {
+                    _nextDecodingVideoTime = decodedPresentationTime;
                 }
-            } while (r && decodedPresentationTime < presentationTime);
 
-            // If we did get a frame to show, then update the time.
-            if (r) {
-                _nextDecodingVideoTime = decodedPresentationTime;
+                // If the video stream ends, raise Ended event.
+                if (!r && videoPackets.Count == 0)
+                {
+                    if (IsLooped)
+                    {
+                        ++_currentLoopNumber;
+
+                        // About avcodec_flush_buffers:
+                        // https://ffmpeg.org/doxygen/3.1/group__lavc__encdec.html
+
+                        if (_videoContext != null)
+                        {
+                            ffmpeg.avcodec_flush_buffers(_videoContext.CodecContext);
+                        }
+
+                        if (_audioContext != null)
+                        {
+                            ffmpeg.avcodec_flush_buffers(_audioContext.CodecContext);
+                        }
+
+                        Seek(0, false);
+                    }
+                    else
+                    {
+                        if (!_isEndedTriggered)
+                        {
+                            // Must use BeginInvoke. See the explanations of Ended.
+                            Ended?.BeginInvoke(this, EventArgs.Empty, null, null);
+
+                            _isEndedTriggered = true;
+                        }
+                    }
+                }
             }
-
-            // If the video stream ends, raise Ended event.
-            if (!r && videoPackets.Count == 0) {
-                if (IsLooped) {
-                    ++_currentLoopNumber;
-
-                    // About avcodec_flush_buffers:
-                    // https://ffmpeg.org/doxygen/3.1/group__lavc__encdec.html
-
-                    if (_videoContext != null) {
-                        ffmpeg.avcodec_flush_buffers(_videoContext.CodecContext);
-                    }
-
-                    if (_audioContext != null) {
-                        ffmpeg.avcodec_flush_buffers(_audioContext.CodecContext);
-                    }
-
-                    Seek(0, false);
-                } else {
-                    if (!_isEndedTriggered) {
-                        // Must use BeginInvoke. See the explanations of Ended.
-                        Ended?.BeginInvoke(this, EventArgs.Empty, null, null);
-
-                        _isEndedTriggered = true;
-                    }
-                }
+            catch (Exception e)
+            {
+                
             }
         }
 
